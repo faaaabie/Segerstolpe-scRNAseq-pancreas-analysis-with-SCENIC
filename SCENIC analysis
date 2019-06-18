@@ -1,0 +1,166 @@
+```{r exprMat}
+#To start analysing with SCENIC an expression matrix has to be created from the data.
+#Set the preffered directory.
+setwd("~/T2D_vs_ND")
+#Load required packages.
+require(SCENIC)
+require(AUCell)
+require(SingleCellExperiment)
+#Load in the file that contains the data. In this case it is a RDS file that contains an object of the class SingleCellExperiment.
+T2D <- readRDS("segerstolpe.Rds")
+#To get the expression data, genes as rows and cells as columns, the function counts() from the package SingleCellExperiment can be used.
+exprMat <- counts(T2D)
+#To select only alpha or beta cells.
+exprMat <- exprMat[,(rownames(colData(T2D))[(which(colData(T2D)$cell_type1=="beta"))])]
+exprMat <- exprMat[,(rownames(colData(T2D))[(which(colData(T2D)$cell_type1=="alpha"))])]
+saveRDS(exprMat, "data/exprMat.Rds")
+```
+
+```{r scenicOptions}
+#scenicOptions is created here with the function initializeScenic. The organism is human, so hgnc.
+org="hgnc"
+dbDir="~/T2D_vs_ND/databases"
+myDatasetTitle="T2D vs ND"
+scenicOptions <- initializeScenic(org = org, dbDir = dbDir, datasetTitle = myDatasetTitle, nCores = 20)
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+```
+
+```{r cellInfo}
+#Create a file that contains the information on cellType and other factors that are interesting to color the cells by in a t-SNE and heatmap.
+#Get the names of the meta data assigned to the cells with the function colData()
+cellInfo <- colData(T2D)
+head(cellInfo)
+#Only the celltypes, "celltype_1", column 2; conditions, "disease", column 3; and gender, "sex", column 4 are kept from the column data.
+cellInfo <- cellInfo[,-c(1, 5:33)]
+#Get the name of the donor for each cell, the name of the donor is the first part of the cellname, to add it to the cellInfo dataframe.
+dnrnames<-sub("(\\_|\\.).+","", colnames(T2D))
+cellInfo <- cbind(cellInfo, dnrnames)
+#Rename the column names
+colnames(cellInfo) <- c("cellType", "condition", "sex", "donor")
+head(cellInfo)
+saveRDS(cellInfo, "int/cellInfo.Rds")
+
+#Make a list containing the colors that need to be assigned to the celltypes and the conditions.
+colVars <- list(cellType=c("alpha" = "#7570b3", "beta" = "#e7298a" , "delta"="#66a61e", "ductal"="#a6761d", "acinar"="#e6ab02", "co-expression" = "#999999", "endothelial" = "#377eb8", "epsilon"="#000000", "gamma"="#1b9e77", "mast"="#606060", "MHC class II"="#A9A9A9", "not applicable"="#C0C0C0", "PSC"="#d95f02", "unclassified"="#F0F0F0", "unclassified endocrine"="#282828"), condition=c("normal"="#ffb90f", "type II diabetes mellitus"="#e41a1c"))
+saveRDS(colVars, "int/colVars.Rds")
+```
+
+```{r genefiltering}
+#Filter the genes with the function geneFiltering() from the SCENIC package. By setting minCountsPerGene the genes are filtered by total number of reads per gene. By setting minSamples the genes are filtered by the number of cells in which the gene is detected.
+genesKept <- geneFiltering(exprMat, scenicOptions, minCountsPerGene = 5, minSamples = ncol(exprMat) * 0.01)
+exprMat_filtered <- exprMat[genesKept,]
+```
+
+```{r correlation}
+#Run a Spearman correlation on the genes. This will be used to find if the expression of a gene is is positively or negatively correlated with the expression of a TF.
+runCorrelation(exprMat_filtered, scenicOptions)
+```
+
+```{r run SCENIC}
+#The steps to run SCENIC, with wrapper functions.
+#possible normalisation/transformation
+#exprMat_filtered <- log(exprMat_filtered + 1)
+#exprMat <- log(exprMat + 1)
+#GENIE3 will calculate the co-expression.
+runGenie3(exprMat_filtered, scenicOptions)
+
+#Change some settings to get resproducable results and use less cores when running on a cluster.
+scenicOptions@settings$verbose <- TRUE
+scenicOptions@settings$nCores <- 10
+scenicOptions@settings$seed <- 123
+#This creates the co-expression modules by taking the result from GENIE3 and the Spearman correlation.
+runSCENIC_1_coexNetwork2modules(scenicOptions)
+#This uses RcisTarget to check for motif enrichment in the genes which are under the control of a TF. This results in regulons.
+runSCENIC_2_createRegulons(scenicOptions)
+#The gene regulatory network/regulons can now be used to score the cells for activity of the regulon by calculating the AUC.
+runSCENIC_3_scoreCells(scenicOptions, exprMat)
+```
+
+```{r binarization}
+#Adjust the thresholds of the regulons that determines if they are active in cells, and select only part of the cells with a shiny app.
+aucellApp <- plotTsne_AUCellApp(scenicOptions, exprMat)
+savedSelections <- shiny::runApp(aucellApp)
+
+#Save the thresholds in a RDS file and change the filename in scenicOptions. 
+newThresholds <- savedSelections$thresholds
+scenicOptions@fileNames$int["aucell_thresholds",1] <- "int/newThresholds.Rds"
+saveRDS(newThresholds, file=getIntName(scenicOptions, "aucell_thresholds"))
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+
+#Binarization of the regulon activity based on the thresholds.
+runSCENIC_4_aucell_binarize(scenicOptions)
+```
+
+```{r tsne}
+#Calculate own tsne.
+require(philentropy)
+require(reshape2)
+binaryRegulonActivity <- readRDS("int/4.1_binaryRegulonActivity.Rds")
+
+#Calculate the distances of cells based on the binary regulon activity. 
+binaryRegulonActivity2 <- t(binaryRegulonActivity)
+distanceall <- philentropy::distance(binaryRegulonActivity2, method="jaccard")
+colnames(distanceall) <- rownames(distanceall) <- colnames(binaryRegulonActivity)
+
+#Calculate tsne coordinates from the distances. Color cells by the elements defined in cellInfo 
+require(Rtsne)
+set.seed(123)
+tsnb <- Rtsne(distanceall, is_distance=TRUE, perplexity=30)
+require(AUCell)
+
+tsneba <- tsnb$Y
+rownames(tsneba) <- rownames(distanceall)
+pdf(file="calculated_tsne.pdf")
+plotTsne_cellProps(tsneba, cellInfo=cellInfo, colVars=colVars)
+dev.off()
+```
+
+```{r Fisher test on condition and number of cells active for regulons}
+#Calculate which regulons are more active or inactive in T2D patients compared to non-diabetic donors.
+nrbin <- nrow(binaryRegulonActivity)
+k <- data.frame(rownames=rownames(binaryRegulonActivity), "p-value"=0, "c interval low"=0, "c interval high"=0, "odds ratio"=0, "up_down"=0 )
+rownames(k) <- k[,1]
+k$rownames <- NULL
+a <- "normal"
+for (i in 1:nrbin){
+  nregpcon <- matrix(c(sum(binaryRegulonActivity[i, which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$condition==a)])]),
+                     ncol(binaryRegulonActivity) - sum(binaryRegulonActivity[i, which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$condition==a)])]),
+                     sum(binaryRegulonActivity[i, which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$condition!=a)])]),
+                     ncol(binaryRegulonActivity) - sum(binaryRegulonActivity[i, which(colnames(binaryRegulonActivity) %in% rownames(cellInfo)[which(cellInfo$condition!=a)])])), ncol=2)
+
+l <- fisher.test(nregpcon)  
+k[i,1] <- l$p.value
+k[i,2] <- l$conf.int[1]
+k[i,3] <- l$conf.int[2]
+k[i,4] <- l$estimate[["odds ratio"]]
+if ((nregpcon[1,1]/nregpcon[2,1]) > (nregpcon[1,2]/nregpcon[2,2])){k[i,5] <- "UP"}
+else{k[i,5] <- "DOWN"}
+
+}
+View(k)
+rownames(k)[which(k$p.value<(0.05/nrbin))]
+```
+
+```{r PCA}
+#Perform a different dimensionality reduction method, PCA.
+pca <- prcomp(t(binaryRegulonActivity), scale.=F)
+#make a barplot of the percentage the pca contributes
+pca.var <- pca$sdev^2
+pca.var.per <- round(pca.var/sum(pca.var)*100, 1)
+barplot(pca.var.per, main="Scree plot", xlab="Principal Component", ylab="Percent Variation")
+#make a pca plot with ggplot, first make the right format
+cellInfo <- readRDS("int/cellInfo.Rds") #in nonormalisation/allcells
+pca.data <- data.frame(Cell=rownames(pca$x), X=pca$x[,1], Y=pca$x[,2])
+pca.data.m <- base::merge(pca.data, cellInfo, by=0)
+rownames(pca.data.m) <- pca.data.m$Row.names
+pca.data.m$Row.names <- NULL
+#make a pca plot with ggplot colored by donor
+require(ggplot2)
+ggplot(data=pca.data.m, aes(x=X, y=Y, color=condition)) +
+  geom_point() +
+  xlab(paste("PC1 - ", pca.var.per[1], "%", sep="")) +
+  ylab(paste("PC2 - ", pca.var.per[2], "%", sep="")) +
+  theme_bw() +
+  ggtitle("PCA plot alpha cells") +
+  scale_color_manual(values=c("#ffb90f", "#e41a1c")
+```
